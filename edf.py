@@ -69,8 +69,6 @@ class EEGFeatureComputation:
     def spect(self, psds, freqs, title, epoch_length, start_time, output_file):
         plt.close()
         plt.figure(figsize=(14, 5))
-        
-        # Average the PSDs across channels for each epoch
         avg_psds = np.nanmean(psds, axis=1)
         
         T = avg_psds.shape[0] * epoch_length / 3600
