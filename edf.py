@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import os
 import pandas as pd
 from mne.time_frequency import psd_array_multitaper
-from sklearn.linear_model import LinearRegression
+from scipy.stats import linregress
+import re
 
 plt.rcParams.update({'font.size': 16})
 
@@ -35,15 +36,32 @@ class EEGFeatureComputation:
         self.stages = self.load_stages()
 
     def load_stages(self):
-        # Load sleep stages
-        annotations_df = pd.read_csv(self.stagepath)
-        annotations_df['time'] = pd.to_datetime(annotations_df['time'], format='%H:%M:%S').dt.time
-        sleep_stage_df = annotations_df[annotations_df['event'].str.contains('Sleep_stage_')]  # isolating only the sleep 'stages'
+        df = pd.read_csv(self.stagepath)
+        df['time'] = pd.to_datetime(df['time'], format='%H:%M:%S').dt.time
+        sleep_stage_df = df[df['event'].str.contains('Sleep_stage_')]
         sleep_stage_df = sleep_stage_df.groupby('epoch').first().reset_index()
+        sleep_stage_df['stage'] = sleep_stage_df['event'].str.replace('Sleep_stage_', '')
         return sleep_stage_df
 
+    def filter_stages(self, results_df):
+        df = pd.read_csv(self.stagepath)
+        pattern = r'(?i)(lights?\s*(?:out?|0|on|1))'
+        matches = df['event'].str.extract(pattern, expand=False)
+
+        # Get indices of all matches
+        match_indices = matches.dropna().index
+
+        # Initialize start and end indices
+        start_index = match_indices[0] if match_indices[0] != None else None
+        end_index = match_indices[1] if match_indices[1] != None else None
+
+        filtered_df = results_df.iloc[start_index + 1:end_index].reset_index(drop=True)
+        return filtered_df
+        
+
+
     def preprocess_data(self):
-        raw = mne.io.read_raw_edf(self.edf_path, preload=False)  # do this to get raw.ch_names
+        raw = mne.io.read_raw_edf(self.edf_path, preload=False)
         raw = mne.io.read_raw_edf(self.edf_path, preload=True, exclude=[x for x in raw.ch_names if x not in self.channels])
         raw.notch_filter(freqs=60)
         raw.filter(l_freq=0.3, h_freq=35)
@@ -60,46 +78,12 @@ class EEGFeatureComputation:
 
     def avg(self, psds, channel_names, channels):
         indices = [channel_names.index(ch) for ch in channels if ch in channel_names]
-        if not indices:
-            print(f"channel {channels} not found in data")
-        else:
-            print(f"channel {channels} found at indices {indices}")
-        return np.nanmean(psds[:, indices, :], axis=1)  # use nanmean instead of mean to ignore nan (due to log(0))
-
-    def spect(self, psds, freqs, title, epoch_length, start_time, output_file):
-        plt.close()
-        plt.figure(figsize=(14, 5))
-        avg_psds = np.nanmean(psds, axis=1)
-        
-        T = avg_psds.shape[0] * epoch_length / 3600
-        plt.imshow(avg_psds.T, aspect='auto', origin='lower', extent=[0, T, freqs[0], freqs[-1]], cmap='turbo', vmin=15, vmax=30)
-        
-        xticks = np.arange(int(T) + 1)
-        xticklabels = [(start_time + datetime.timedelta(hours=int(x))).strftime('%H:%M') for x in xticks]
-
-        plt.colorbar(label='Power Spectral Density (dB/Hz)')
-        plt.title(title)
-        plt.xticks(xticks, labels=xticklabels)
-        plt.ylabel('Frequency (Hz)')
-        plt.xlabel('Time (hours)')
-        plt.savefig(output_file, dpi=500, bbox_inches='tight')
-
+        return np.nanmean(psds[:, indices, :], axis=1)
 
     def get_band_power(self, psds_db, freqs, band_mask):
-        """
-        psds_db: PSD in decibel/Hz
-        freqs: the frequency bins
-        band_mask: a boolean array to indicate the band of interest
-        """
-        # for band power, one must convert decibel/Hz back to uV^2/Hz, since power is defined in uV^2
         psds = np.power(10, psds_db / 10)
-        
-        # band power (bp) is defined as the area under the spectrum, we should use rectangle approximation to calculate the area under curve
-        # each rectangle area is width x height = frequency bin width x power density at that frequency bin
-        dfreq = freqs[1] - freqs[0]  # frequency bin width, assumes constant interval
+        dfreq = freqs[1] - freqs[0]
         bp = np.nansum(psds[..., band_mask], axis=-1) * dfreq
-        
-        # then convert band power to decibel (log-scale) for better numerical behavior
         return 10 * np.log10(bp)
 
     def compute_band_powers(self):
@@ -111,74 +95,66 @@ class EEGFeatureComputation:
                 avg_psds = self.avg(self.psds, self.epochs.ch_names, channels)
                 band_powers[band][region] = self.get_band_power(avg_psds, self.freqs, band_mask)
         
-        sleep_stages = self.stages['event'].values
-        
-        # Compute overnight slopes - only care about the nrem, gaps in the nrem range - time axis should contain the gap - when x is created the gap in x should be maintain
-        # we just need a plain old simple lin reg - adjust the coefficient - might've been removed
-        overnight_slopes = {}
-        for band in self.bands.keys():
-            overnight_slopes[band] = {}
-            for region in self.channels_dict.keys():
-                nrem_mask = (sleep_stages == 'Sleep_stage_N1') | (sleep_stages == 'Sleep_stage_N2') | (sleep_stages == 'Sleep_stage_N3')
-                if np.any(nrem_mask):
-                    X = (np.arange(np.sum(nrem_mask)).reshape(-1, 1))/(3600)
-                    y = band_powers[band][region][nrem_mask]
-                    model = LinearRegression().fit(X, y)
-                    overnight_slopes[band][region] = model.coef_[0]
-        
-        return band_powers, sleep_stages, overnight_slopes
+        return band_powers
 
-    def plot_alpha(self, alpha_power, title):
-        plt.close()  # moved from bottom
-        plt.figure()
-        plt.plot(alpha_power)
-        plt.title(title)
-        plt.xlabel('Epochs')
-        plt.ylabel('Alpha Power (8-12Hz) (dB)')
-        output_file = os.path.join(self.output_dir, title.replace(' ', '_').lower() + '.png')
-        plt.savefig(output_file, dpi=500)
+    def compute_slopes(self, band_powers):
+        slopes = {}
+        for band in self.bands.keys():
+            slopes[band] = {}
+            for region in self.channels_dict.keys():
+                slopes[band][region] = {}
+                for stage in ['W', 'N1', 'N2', 'N3', 'REM', 'NREM', '?', 'R']:
+                    if stage == 'NREM':
+                        stage_mask = self.stages['stage'].isin(['N1', 'N2', 'N3'])
+                    elif stage == '?':
+                        stage_mask = self.stages['stage'] == 'W'
+                    elif stage == 'R':
+                        stage_mask = self.stages['stage'] == 'REM'
+                    else:
+                        stage_mask = self.stages['stage'] == stage
+                    
+                    if np.sum(stage_mask) > 1:  # Need at least 2 points for regression
+                        x = np.arange(len(stage_mask))[stage_mask] / 120  # Convert to hours (30-second epochs)
+                        y = band_powers[band][region][stage_mask]
+                        slope, _, _, _, _ = linregress(x, y)
+                        slopes[band][region][stage] = slope
+                    else:
+                        slopes[band][region][stage] = np.nan
+        
+        return slopes
 
-    def save_results(self, band_powers, sleep_stages, overnight_slopes):
-        # Save results to CSV
-        results = {'epoch': np.arange(1, len(self.epochs) + 1)}
-        for band in self.bands.keys():
-            for region in self.channels_dict.keys():
-                results[f'{band}_{region}'] = band_powers[band][region]
-                results[f'{band}_{region}_slope'] = overnight_slopes[band][region]
+    def create_unified_dataframe(self, band_powers, slopes):
+        results = []
+        for epoch in range(len(self.epochs)):
+            row = {'epoch': epoch + 1, 'time': (self.start_time + datetime.timedelta(seconds=30*epoch)).strftime('%H:%M:%S')}
+            row['stage'] = self.stages.loc[self.stages['epoch'] == epoch + 1, 'stage'].values[0]
+            
+            for band in self.bands.keys():
+                for region in self.channels_dict.keys():
+                    row[f'{band}_{region}_power'] = band_powers[band][region][epoch]
+                    row[f'{band}_{region}_slope_{row["stage"]}'] = slopes[band][region][row['stage']]
+                    row[f'{band}_{region}_slope_NREM'] = slopes[band][region]['NREM']
+            
+            results.append(row)
         
-        results_df = pd.DataFrame(results)
-        results_df.to_csv(os.path.join(self.output_dir, 'band_powers1.csv'), index=False)
-        
-        alpha_band = (self.freqs >= 8) & (self.freqs <= 12)
-        central_alpha = self.get_band_power(self.avg(self.psds, self.epochs.ch_names, self.channels_dict['central']), self.freqs, alpha_band)
-        self.plot_alpha(central_alpha, 'Central Alpha Power')
-        
-        stage_labels = self.stages['event'].unique()
-        stage_powers = {}
-        
-        for stage in stage_labels:
-            stage_mask = (sleep_stages == stage)
-            if np.any(stage_mask):
-                stage_powers[stage] = {}
-                for band in self.bands.keys():
-                    stage_powers[stage][band] = {}
-                    for region in self.channels_dict.keys():
-                        stage_powers[stage][band][region] = np.nanmean(band_powers[band][region][stage_mask])
-        
-        stage_results = {'stage': stage_labels}
-        for band in self.bands.keys():
-            for region in self.channels_dict.keys():
-                stage_results[f'{band}_{region}'] = [stage_powers[stage][band][region] for stage in stage_labels]
-        
-        stage_results_df = pd.DataFrame(stage_results)
-        stage_results_df.to_csv(os.path.join(self.output_dir, 'stage_band_powers.csv'), index=False)
+        return pd.DataFrame(results)
 
     def run(self):
         self.preprocess_data()
-        band_powers, sleep_stages, overnight_slopes = self.compute_band_powers()
-        self.spect(self.psds, self.freqs, 'Spectrogram', 30, self.start_time, os.path.join(self.output_dir, 'spectrogram.png'))
-        self.save_results(band_powers, sleep_stages, overnight_slopes)
+        band_powers = self.compute_band_powers()
+        slopes = self.compute_slopes(band_powers)
+        results_df = self.create_unified_dataframe(band_powers, slopes)
+        
+        # Save results
+        results_df.to_csv(os.path.join(self.output_dir, 'eeg_features.csv'), index=False)
         print("All computations are completed and results are saved.")
+        
+        # Filter results_df based on LIGHTS OFF and LIGHTS ON
+        filtered_results_df = self.filter_stages(results_df)
+        filtered_results_df.to_csv(os.path.join(self.output_dir, 'filtered_eeg_features.csv'), index=False)
+        print("Filtered results are saved.")
+        
+        return filtered_results_df
 
 if __name__ == "__main__":
     edf_path = "/Users/raosamvr/Downloads/sub-S0001111189359_ses-1_task-psg_eeg.edf"
@@ -187,4 +163,5 @@ if __name__ == "__main__":
     channels = ['F3-M2', 'F4-M1', 'C3-M2', 'C4-M1', 'O1-M2', 'O2-M1']
     
     eeg_feature_computation = EEGFeatureComputation(edf_path, channels, stagepath, output_dir)
-    eeg_feature_computation.run()
+    results_df = eeg_feature_computation.run()
+    print(results_df.head())
