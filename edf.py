@@ -9,11 +9,9 @@ from scipy.stats import linregress
 import re
 import yasa
 
-
-
 plt.rcParams.update({'font.size': 16})
 
-class EEGFeatureComputation: #now returns a pandas
+class EEGFeatureComputation:
     def __init__(self, edf_path, channels, stagepath, output_dir):
         self.edf_path = edf_path
         self.channels = channels
@@ -46,17 +44,16 @@ class EEGFeatureComputation: #now returns a pandas
         sleep_stage_df['stage'] = sleep_stage_df['event'].str.replace('Sleep_stage_', '')
         return sleep_stage_df
 
-    def filter_stages(self, results_df): #new filter stages function - filters based on a regex pattern; right now, it filters postprocessing but can be altered to filter preprocessing
+    def filter_stages(self, results_df):
+        # Filtering stages to exclude times before lights off and after lights on
         df = pd.read_csv(self.stagepath)
-        pattern = r'(?i)(lights?\s*(?:out?|0|on|1))'
+        pattern = r'(?i)(lights?\s*(?:out?|0|on|1))' #regex to capture lightsout/on
         matches = df['event'].str.extract(pattern, expand=False)
         match_indices = matches.dropna().index
         start_index = match_indices[0] if match_indices[0] != None else None
         end_index = match_indices[1] if match_indices[1] != None else None
         filtered_df = results_df.iloc[start_index + 1:end_index].reset_index(drop=True)
         return filtered_df
-        
-
 
     def preprocess_data(self):
         raw = mne.io.read_raw_edf(self.edf_path, preload=False)
@@ -94,14 +91,36 @@ class EEGFeatureComputation: #now returns a pandas
                 band_powers[band][region] = self.get_band_power(avg_psds, self.freqs, band_mask)
         
         return band_powers
+    
+    def spect(self, psds, freqs, title, epoch_length, start_time, output_file):
+        plt.close()
+        plt.figure(figsize=(14, 5))
+
+        # Average the PSDs across channels for each epoch
+        avg_psds = np.nanmean(psds, axis=1)
+
+        T = avg_psds.shape[0] * epoch_length / 3600
+        plt.imshow(avg_psds.T, aspect='auto', origin='lower', extent=[0, T, freqs[0], freqs[-1]], cmap='turbo', vmin=15, vmax=30)
+
+        xticks = np.arange(int(T) + 1)
+        xticklabels = [(start_time + datetime.timedelta(hours=int(x))).strftime('%H:%M') for x in xticks]
+
+        plt.colorbar(label='Power Spectral Density (dB/Hz)')
+        plt.title(title)
+        plt.xticks(xticks, labels=xticklabels)
+        plt.ylabel('Frequency (Hz)')
+        plt.xlabel('Time (hours)')
+        plt.savefig(output_file, dpi=500, bbox_inches='tight')
 
     def compute_slopes(self, band_powers):
+        # Computing slopes for each band and region, stratified by sleep stage
         slopes = {}
         for band in self.bands.keys():
             slopes[band] = {}
             for region in self.channels_dict.keys():
                 slopes[band][region] = {}
                 for stage in ['W', 'N1', 'N2', 'N3', 'REM', 'NREM', 'R']:
+                    # Stratify by stage, including NREM (N1+N2+N3) and R (REM), REM = REM, W = Wake
                     if stage == 'NREM':
                         stage_mask = self.stages['stage'].isin(['N1', 'N2', 'N3'])
                     elif stage == 'R':
@@ -115,6 +134,7 @@ class EEGFeatureComputation: #now returns a pandas
                         cumulative_time = np.cumsum(stage_mask * 30 / 3600)
                         
                         y = band_powers[band][region][stage_mask]
+                        # Use scipy.stats.linregress for linear regression
                         slope, _, _, _, _ = linregress(cumulative_time[stage_mask], y)
                         slopes[band][region][stage] = slope
                     else:
@@ -123,6 +143,7 @@ class EEGFeatureComputation: #now returns a pandas
         return slopes
 
     def create_unified_dataframe(self, band_powers, slopes):
+        # Creating a unified DataFrame containing all computed features - final pandas
         results = []
         for epoch in range(len(self.epochs)):
             row = {
@@ -163,7 +184,7 @@ class EEGFeatureComputation: #now returns a pandas
         
         data_reshaped = data.reshape(n_channels, -1)
         
-        # Scale data to microvolts
+        # Scale data to microvolts - yasa required it in this manner
         data_uv = data_reshaped * 1e6
         
         for ch_idx in range(n_channels):
@@ -185,7 +206,7 @@ class EEGFeatureComputation: #now returns a pandas
                         else:
                             print(f"Warning: Column '{col}' not found in spindle summary for {ch_name}")
                     
-                    agg_dict['Oscillations'] = 'size'
+                    agg_dict['Oscillations'] = 'size' #presume this is the number of spindles in a given epoch? but not sure
                     
                     grouped = summary.groupby('epoch').agg(agg_dict).reset_index()
                     
@@ -200,19 +221,23 @@ class EEGFeatureComputation: #now returns a pandas
         spindles_df = spindles_df.fillna(0)
         
         results_df = pd.merge(self.create_unified_dataframe(self.compute_band_powers(), self.compute_slopes(self.compute_band_powers())), 
-                            spindles_df, on='epoch', how='left')
+                            spindles_df, on='epoch', how='left') #all merging happens here; final output is pandasdf
         
         return results_df
-
-
 
     def run(self):
         self.preprocess_data()
         band_powers = self.compute_band_powers()
         slopes = self.compute_slopes(band_powers)
         results_df = self.detect_spindles(self.epochs.get_data(), self.epochs.info['sfreq'])  
-        filtered_results_df = self.filter_stages(results_df) #calling filtered rsults
+        filtered_results_df = self.filter_stages(results_df) # Calling filtered results
         print("Filtered results are saved.")
+
+        spectrogram_output = os.path.join(self.output_dir, 'spectrogram.png')
+        self.spect(self.psds, self.freqs, 'EEG Spectrogram', 30, self.start_time, spectrogram_output)
+        print("Spectrogram saved.")
+
+        
         return filtered_results_df
 
 if __name__ == "__main__":
