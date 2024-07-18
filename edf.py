@@ -7,6 +7,9 @@ import pandas as pd
 from mne.time_frequency import psd_array_multitaper
 from scipy.stats import linregress
 import re
+import yasa
+
+
 
 plt.rcParams.update({'font.size': 16})
 
@@ -142,6 +145,64 @@ class EEGFeatureComputation: #now returns a pandas
             results.append(row)
         
         return pd.DataFrame(results)
+    
+    def detect_spindles(self, data, sfreq):
+        """
+        Detect sleep spindles using YASA and integrate results with existing data.
+        
+        Parameters:
+        data (np.ndarray): Numpy array of shape (n_channels, n_epochs, n_times)
+        sfreq (float): Sampling frequency of the EEG data
+        
+        Returns:
+        pd.DataFrame: DataFrame containing detected spindles integrated with existing data
+        """
+        n_epochs, n_channels, n_times = data.shape
+        spindles_df = pd.DataFrame(index=range(1, n_epochs + 1))
+        spindles_df['epoch'] = spindles_df.index
+        
+        data_reshaped = data.reshape(n_channels, -1)
+        
+        # Scale data to microvolts
+        data_uv = data_reshaped * 1e6
+        
+        for ch_idx in range(n_channels):
+            ch_name = f'channel_{ch_idx}' 
+            
+            sp = yasa.spindles_detect(data_uv[ch_idx], sfreq)
+            
+            if sp is not None:
+                summary = sp.summary()
+                if not summary.empty:
+                    summary['Start'] = pd.to_timedelta(summary['Start'], unit='s')
+                    summary['Start_time'] = self.start_time + summary['Start']
+                    summary['epoch'] = (summary['Start'].dt.total_seconds() / 30).astype(int) + 1
+                    x=1
+                    agg_dict = {}
+                    for col in ['Duration', 'Amplitude', 'Frequency']:
+                        if col in summary.columns:
+                            agg_dict[col] = 'mean'
+                        else:
+                            print(f"Warning: Column '{col}' not found in spindle summary for {ch_name}")
+                    
+                    agg_dict['Oscillations'] = 'size'
+                    
+                    grouped = summary.groupby('epoch').agg(agg_dict).reset_index()
+                    
+                    grouped.columns = [f'{col}_{ch_name}' if col != 'epoch' else col for col in grouped.columns]
+                    
+                    spindles_df = pd.merge(spindles_df, grouped, on='epoch', how='left')
+                else:
+                    print(f"No spindles detected for channel {ch_idx}")
+            else:
+                print(f"Spindle detection failed for channel {ch_idx}")
+        
+        spindles_df = spindles_df.fillna(0)
+        
+        results_df = pd.merge(self.create_unified_dataframe(self.compute_band_powers(), self.compute_slopes(self.compute_band_powers())), 
+                            spindles_df, on='epoch', how='left')
+        
+        return results_df
 
 
 
@@ -149,12 +210,9 @@ class EEGFeatureComputation: #now returns a pandas
         self.preprocess_data()
         band_powers = self.compute_band_powers()
         slopes = self.compute_slopes(band_powers)
-        results_df = self.create_unified_dataframe(band_powers, slopes)
-        results_df.to_csv(os.path.join(self.output_dir, 'eeg_features.csv'), index=False)
-        print("All computations are completed and results are saved.")
+        results_df = self.detect_spindles(self.epochs.get_data(), self.epochs.info['sfreq'])  
         filtered_results_df = self.filter_stages(results_df) #calling filtered rsults
         print("Filtered results are saved.")
-        
         return filtered_results_df
 
 if __name__ == "__main__":
