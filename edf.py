@@ -6,9 +6,23 @@ import os
 import pandas as pd
 from mne.time_frequency import psd_array_multitaper
 from scipy.stats import linregress
+from scipy.signal import hilbert
 import re
 import yasa
-
+"""unified interface: make the output one pandas.DataFrame (if possible)
+fix previous problems:
+stratify by stage: W, N1, N2, N3, REM, NREM
+[optional, I forget to mention during meeting] we should exclude times before lights off and after lights on (need time from annotation); W can be further divided into wake before sleep onset, wake after sleep onset, wake after sleep in the morning
+computing slope
+time axis: keep gap
+time axis: unit in hours
+Linear regression: use scipy.stats.linregress
+install Luna for spindle detection: https://zzz.bwh.harvard.edu/luna/download/
+Install LunaC and LunaR
+Install Luna python package `lunapi`
+[Luna is difficult to install... a bit easier under Linux. If you can't manage to install it. you can switch to YASA]
+run the Luna/YASA tutorial about spindle detection
+"""
 plt.rcParams.update({'font.size': 16})
 
 class EEGFeatureComputation:
@@ -190,7 +204,7 @@ class EEGFeatureComputation:
         for ch_idx in range(n_channels):
             ch_name = f'channel_{ch_idx}' 
             
-            sp = yasa.spindles_detect(data_uv[ch_idx], sfreq)
+            sp = yasa.spindles_detect(data_uv[ch_idx], sfreq) #default parameters - dropdown list - basically parameter input
             
             if sp is not None:
                 summary = sp.summary()
@@ -225,20 +239,135 @@ class EEGFeatureComputation:
         
         return results_df
 
+    def detect_slow_oscillations(self, data, sfreq):
+        """
+        Detect slow oscillations using YASA and integrate results with existing data.
+        
+        Parameters:
+        data (np.ndarray): Numpy array of shape (n_epochs, n_channels, n_times)
+        sfreq (float): Sampling frequency of the EEG data
+        
+        Returns:
+        pd.DataFrame: DataFrame containing detected slow oscillations integrated with existing data
+        """
+        n_epochs, n_channels, n_times = data.shape
+        so_df = pd.DataFrame(index=range(1, n_epochs + 1))
+        so_df['epoch'] = so_df.index
+        
+        data_reshaped = data.reshape(n_epochs * n_channels, n_times)
+        
+        # Scale data to microvolts
+        data_uv = data_reshaped * 1e6
+        
+        for ch_idx in range(n_channels):
+            ch_name = f'channel_{ch_idx}'
+            epoch_sos = []
+            
+            for epoch_idx in range(n_epochs):
+                epoch_data = data_uv[epoch_idx * n_channels + ch_idx]
+                
+                so = yasa.sw_detect(epoch_data, sfreq)
+                
+                if so is not None:
+                    summary = so.summary()
+                    if not summary.empty:
+                        summary['Start'] = pd.to_timedelta(summary['Start'], unit='s')
+                        summary['Start_time'] = self.start_time + summary['Start']
+                        summary['epoch'] = epoch_idx + 1
+                        
+                        epoch_sos.append(summary)
+                    else:
+                        print(f"No slow oscillations detected for epoch {epoch_idx}, channel {ch_idx}")
+                else:
+                    print(f"Slow oscillation detection failed for epoch {epoch_idx}, channel {ch_idx}")
+            
+            if epoch_sos:
+                epoch_sos_df = pd.concat(epoch_sos)
+                agg_dict = {
+                    'Duration': 'mean',
+                    'Start_time': 'mean',
+                    'Frequency': 'mean',
+                    'NegPeak': 'mean',
+                    'MidCrossing': 'mean',
+                    'PosPeak': 'mean'
+                }
+                
+                grouped = epoch_sos_df.groupby('epoch').agg(agg_dict).reset_index()
+                
+                grouped.columns = [f'SO_{col}_{ch_name}' if col != 'epoch' else col for col in grouped.columns]
+                
+                so_df = pd.merge(so_df, grouped, on='epoch', how='left')
+        
+        so_df = so_df.fillna(0)
+        return so_df
+
+    def compute_spindle_so_coupling(self, data, sfreq):
+        """
+        Detect spindles and slow oscillations and compute their coupling using YASA.
+        Parameters:
+        data (np.ndarray): Numpy array of shape (n_epochs, n_channels, n_times)
+        sfreq (float): Sampling frequency of the EEG data
+        Returns:
+        pd.DataFrame: DataFrame containing spindle-SO coupling metrics
+        """
+        
+        coupling_results = pd.DataFrame(index=range(1, data.shape[0] + 1))
+        coupling_results['epoch'] = coupling_results.index
+        
+        for ch_idx in range(data.shape[1]):
+            ch_name = self.channels[ch_idx]
+            channel_data = data[:, ch_idx, :].reshape(-1) * 1e6  # Convert to µV
+            
+            hypno = self.stages['stage'].map({'W': 0, 'N1': 1, 'N2': 2, 'N3': 3, 'REM': 4}).fillna(-1).astype(int).values
+            
+            hypno = yasa.hypno_upsample_to_data(hypno=hypno, sf_hypno=1/30, data=channel_data, sf_data=sfreq)
+            
+            sw = yasa.sw_detect(channel_data, sfreq, ch_names=[ch_name], hypno=hypno, include=(2, 3), coupling=True,
+                                coupling_params=dict(freq_sp=(12, 16), time=2, p=None))
+            
+            if sw is not None:
+                events = sw.summary()
+                if not events.empty:
+                    events['epoch'] = (events['Start'] / 30).astype(int) + 1
+                    
+                    numeric_columns = events.select_dtypes(include=[np.number]).columns.tolist()
+                    if 'epoch' in numeric_columns:
+                        numeric_columns.remove('epoch')
+                    
+                    events_grouped = events.groupby('epoch')[numeric_columns].mean()
+                    
+                    events_grouped.columns = [f'{col}_{ch_name}' for col in events_grouped.columns]
+                    
+                    coupling_results = pd.merge(coupling_results, events_grouped, left_on='epoch', right_index=True, how='left')
+        
+        return coupling_results.fillna(0)
+
+
+
+
     def run(self):
         self.preprocess_data()
         band_powers = self.compute_band_powers()
         slopes = self.compute_slopes(band_powers)
-        results_df = self.detect_spindles(self.epochs.get_data(), self.epochs.info['sfreq'])  
-        filtered_results_df = self.filter_stages(results_df) # Calling filtered results
+        
+        results_df = self.detect_spindles(self.epochs.get_data(), self.epochs.info['sfreq'])
+        so_df = self.detect_slow_oscillations(self.epochs.get_data(), self.epochs.info['sfreq'])
+        coupling_df = self.compute_spindle_so_coupling(self.epochs.get_data(), self.epochs.info['sfreq'])
+        
+        # Merge all results
+        results_df = pd.merge(results_df, so_df, on='epoch', how='left')
+        results_df = pd.merge(results_df, coupling_df, on='epoch', how='left')
+        
+        filtered_results_df = self.filter_stages(results_df)
         print("Filtered results are saved.")
 
         spectrogram_output = os.path.join(self.output_dir, 'spectrogram.png')
         self.spect(self.psds, self.freqs, 'EEG Spectrogram', 30, self.start_time, spectrogram_output)
         print("Spectrogram saved.")
 
-        
         return filtered_results_df
+
+
 
 if __name__ == "__main__":
     edf_path = "/Users/raosamvr/Downloads/sub-S0001111189359_ses-1_task-psg_eeg.edf"
